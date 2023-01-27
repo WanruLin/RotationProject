@@ -1,0 +1,953 @@
+---
+title: "Rotation2"
+author: "Wanru Lin"
+date: "2023-01-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Read the data
+
+
+```{r}
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(Seurat)
+    library(patchwork)
+    library(DropletUtils)
+    library(ggplot2)
+    library(pheatmap)
+    library(reticulate)
+    library(rjson)
+    library(fishpond)
+    library(HGNChelper)
+    library(roe)
+    library(SC3)
+    library(scater)
+})
+```
+
+
+```{r}
+# return is cell for each row in the input count matrix
+filter_empty <- function(unfiltered_counts) {
+    br.out <- barcodeRanks(unfiltered_counts)
+    e.out <- emptyDrops(unfiltered_counts)
+    is.cell <- e.out$FDR <= 0.01
+    is.cell[is.na(is.cell)] <- FALSE
+    is.cell
+}
+
+create_seurat_object <- function(c, sce, min.cells = 0, min.feature = 0) {
+    rownames(c) <- rownames(sce)
+    colnames(c) <- colnames(sce)
+    CreateSeuratObject(c, min.cells = min.cells, min.feature = min.feature)
+}
+```
+
+
+```{r}
+gid2name_df = read.csv("human2020A_geneid_to_name.tsv", header = FALSE, sep = "\t")
+gid2name = gid2name_df$V2
+names(gid2name) = gid2name_df$V1
+```
+
+```{r}
+# pbmc_quant_dir = "/mnt/scratch3/alevin_fry_submission/Benchmark-snRNAseq/af-private-scripts/nf_pipeline/output/alevin_fry/pbmc10k/fry_unfilt_quant_usa_cr-like"
+pbmc_sce_unfilt = FDL(1,output_format="raw")@sce
+# get rid of the mitochondrial gene
+pbmc_sce_unfilt = pbmc_sce_unfilt[rownames(pbmc_sce_unfilt) %in% names(gid2name), ]
+# get overall count matrix
+c <- pbmc_sce_unfilt@assays@data$spliced + pbmc_sce_unfilt@assays@data$unspliced + pbmc_sce_unfilt@assays@data$ambiguous
+
+# filter empty drops
+is.cell <- filter_empty(c)
+pbmc_sce_filt = pbmc_sce_unfilt[,is.cell]
+rownames(pbmc_sce_filt) = gid2name[rownames(pbmc_sce_filt)]
+pbmc_sce_filt
+
+```
+
+```{r}
+c_usa = pbmc_sce_filt@assays@data$spliced + pbmc_sce_filt@assays@data$ambiguous + pbmc_sce_filt@assays@data$unspliced
+pbmc_usa <- create_seurat_object(c_usa, pbmc_sce_filt)
+pbmc_usa
+```
+
+
+```{r}
+pbmc_usa[["percent.mt"]] <- PercentageFeatureSet(pbmc_usa, pattern = "^MT-")
+```
+
+```{r}
+VlnPlot(pbmc_usa, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+```{r}
+pbmc_usa <- subset(pbmc_usa, subset = nFeature_RNA > 500 & 
+                   nFeature_RNA < 7000 & 
+                   percent.mt < 25 & 
+                   nCount_RNA < 40000)
+pbmc_usa
+```
+
+```{r}
+pbmc_sce_filt <- pbmc_sce_filt[, colnames(pbmc_usa)]
+# pbmc_sce_filt <- pbmc_sce_filt[(rowSums(pbmc_sce_filt@assays@data$spliced + pbmc_sce_filt@assays@data$ambiguous)) != 0 & rowSums(pbmc_sce_filt@assays@data$unspliced) != 0, ]
+```
+
+```{r}
+c_s = as.matrix(pbmc_sce_filt@assays@data$spliced)
+colnames(c_s) = colnames(pbmc_sce_filt)
+rownames(c_s) = rownames(pbmc_sce_filt)
+```
+
+
+```{r}
+c_s_nozero1 = c_s[apply(c_s, 1, function(x) !all(x==0)),]
+dim(c_s_nozero1)
+
+c_s_nozero_t = t(c_s_nozero1)
+dim(c_s_nozero_t)
+```
+
+## Highly variable gene selection
+
+
+```{r}
+# highly variable genes
+hvg_c_s = VariableFeatures(seurat_object_s)
+```
+
+```{r}
+c_s_hvg_counts = t(c_s[hvg_c_s,])
+dim(c_s_hvg_counts)
+```
+
+## Calculate the nearest neighbor graph by manhattan or euclidean distance method for original data or data after highly variable gene selection
+
+```{r}
+library(KODAMA)
+library(cccd)
+knn_c_s_lp = list()
+nng_c_s_lp = list()
+
+knn_c_s_lp[[1]] = knn.dist(c_s_nozero_t, dist.meth = "manhattan",p=1)
+nng_c_s_lp[[1]] = nng(dx = (knn_c_s_lp[[1]]),k = 30,method = "manhattan")
+
+knn_c_s_lp[[2]] = knn.dist(c_s_nozero_t, dist.meth = "euclidean",p=2)
+nng_c_s_lp[[2]] = nng(dx = (knn_c_s_lp[[2]]),k = 30,method = "euclidean")
+```
+
+```{r}
+adj_mtx_manhattan = as_adjacency_matrix(nng_c_s_lp[[1]])
+adj_mtx_euclidean = as_adjacency_matrix(nng_c_s_lp[[2]])
+
+#knn_c_s_hvg_lp[[1]][1,which(adj_mtx_manhattan[1,]==0)] = 0
+for(i in 1:689){
+  knn_c_s_lp[[1]][i,which(adj_mtx_manhattan[i,]==0)] = 0
+}
+for(i in 1:689){
+  knn_c_s_lp[[2]][i,which(adj_mtx_euclidean[i,]==0)] = 0
+}
+
+```
+
+
+
+
+```{r}
+knn_c_s_hvg_lp = list()
+nng_hvg_lp = list()
+
+knn_c_s_hvg_lp[[1]] = knn.dist(c_s_hvg_counts, dist.meth = "manhattan",p=1)
+nng_hvg_lp[[1]] = nng(dx = (knn_c_s_hvg_lp[[1]]),k = 30,method = "manhattan")
+
+knn_c_s_hvg_lp[[2]] = knn.dist(c_s_hvg_counts, dist.meth = "euclidean",p=2)
+nng_hvg_lp[[2]] = nng(dx = (knn_c_s_hvg_lp[[2]]),k = 30,method = "euclidean")
+
+```
+
+
+
+```{r}
+adj_mtx_manhattan = as_adjacency_matrix(nng_hvg_lp[[1]])
+adj_mtx_euclidean = as_adjacency_matrix(nng_hvg_lp[[2]])
+
+
+
+#knn_c_s_hvg_lp[[1]][1,which(adj_mtx_manhattan[1,]==0)] = 0
+for(i in 1:689){
+  knn_c_s_hvg_lp[[1]][i,which(adj_mtx_manhattan[i,]==0)] = 0
+}
+for(i in 1:689){
+  knn_c_s_hvg_lp[[2]][i,which(adj_mtx_euclidean[i,]==0)] = 0
+}
+
+```
+
+## Calculate the geodesic distance
+
+```{r}
+knn_spearman_cor_c_s = knn_spearman_cor(knn_c_s_lp[[1]],knn_c_s_lp[[2]])
+knn_spearman_cor_c_s$spearman_cor
+
+geod_manhattan_c_s = knn_spearman_cor_c_s$dist_knn_1
+geod_euclidean_c_s = knn_spearman_cor_c_s$dist_knn_2
+```
+
+```{r}
+knn_spearman_cor_2 = knn_spearman_cor(knn_c_s_hvg_lp[[1]],knn_c_s_hvg_lp[[2]])
+knn_spearman_cor_2$spearman_cor
+
+geod_manhattan_hvg = knn_spearman_cor_2$dist_knn_1
+geod_euclidean_hvg = knn_spearman_cor_2$dist_knn_2
+```
+
+## Difference of geodesic distance
+
+```{r}
+diff_hvg = (geod_manhattan_hvg-geod_euclidean_hvg)
+diff_c_s = (geod_manhattan_c_s-geod_euclidean_c_s)
+diff_pca50 = (geod_manhattan_pca50 - geod_euclidean_pca50)
+diff_pca30 = (geod_manhattan_pca-geod_euclidean_pca)
+
+diff_m_hvg_vs_cs = (geod_manhattan_hvg-geod_manhattan_c_s)
+diff_e_hvg_vs_cs = (geod_euclidean_hvg-geod_euclidean_c_s)
+
+diff_m_pca30_vs_cs = geod_manhattan_pca-geod_manhattan_c_s
+diff_e_pca30_vs_cs = geod_euclidean_pca-geod_euclidean_c_s
+```
+
+
+```{r}
+df_diff_hvg = data.frame(diff_hvg_value = as.vector(diff_hvg))
+df_diff_c_s = data.frame(diff_c_s_value = as.vector(diff_c_s))
+df_diff_m_hvg_vs_cs = data.frame(diff_m_hvg_vs_cs_value = as.vector(diff_m_hvg_vs_cs))
+df_diff_e_hvg_vs_cs = data.frame(diff_e_hvg_vs_cs_value = as.vector(diff_e_hvg_vs_cs))
+
+df_diff_pca30 = data.frame(diff_pca30_value = as.vector(diff_pca30))
+
+df_diff_m_pca30_vs_cs = data.frame(diff_m_pca30_vs_cs_value = as.vector(diff_m_pca30_vs_cs))
+df_diff_e_pca30_vs_cs = data.frame(diff_e_pca30_vs_cs_value = as.vector(diff_e_pca30_vs_cs))
+```
+
+
+```{r}
+df_diff_hvg_no = subset(df_diff_hvg,diff_hvg_value != 0)
+df_diff_c_s = subset(df_diff_c_s,diff_c_s_value != 0)
+df_diff_m_hvg_vs_cs = subset(df_diff_m_hvg_vs_cs,diff_m_hvg_vs_cs_value != 0)
+df_diff_e_hvg_vs_cs = subset(df_diff_e_hvg_vs_cs,diff_e_hvg_vs_cs_value != 0)
+
+df_diff_pca30 = subset(df_diff_pca30,diff_pca30_value != 0)
+
+df_diff_m_pca30_vs_cs = subset(df_diff_m_pca30_vs_cs,diff_m_pca30_vs_cs_value != 0)
+df_diff_e_pca30_vs_cs = subset(df_diff_e_pca30_vs_cs,diff_e_pca30_vs_cs_value != 0)
+```
+
+```{r}
+median(df_diff_hvg$diff_hvg_value)
+median(df_diff_c_s$diff_c_s_value)
+median(df_diff_m_hvg_vs_cs$diff_m_hvg_vs_cs_value)
+median(df_diff_e_hvg_vs_cs$diff_e_hvg_vs_cs_value)
+
+median(df_diff_pca30$diff_pca30_value)
+median(df_diff_m_pca30_vs_cs$diff_m_pca30_vs_cs_value)
+median(df_diff_e_pca30_vs_cs$diff_e_pca30_vs_cs_value)
+```
+
+
+
+```{r}
+library(ggplot2)
+
+ggplot(data=df_diff_hvg,aes(diff_hvg_value))+ # (0,11373.91)
+  geom_histogram(bins =100,fill="blue",color="black",alpha=0.3)+
+  #geom_vline(aes(xintercept = mean(diff_hvg_value)))+
+  geom_vline(aes(xintercept = median(diff_hvg_value)))+
+  xlab("Difference of geodesic distance between using different ditance metric after filtering") 
+
+ggplot(data=df_diff_c_s,aes(diff_c_s_value))+ # (0.00,27133.52)
+  geom_histogram(bins =100,fill="blue",color="black",alpha=0.3)+
+  geom_vline(aes(xintercept = median(diff_c_s_value)))+
+  xlab("Difference of geodesic distance between using different ditance metric without filtering") 
+
+ggplot(data=df_diff_m_hvg_vs_cs,aes(diff_m_hvg_vs_cs_value))+
+  geom_histogram(bins =100,fill="blue",color="black",alpha=0.3)+
+  geom_vline(aes(xintercept = median(diff_m_hvg_vs_cs_value)))+
+  xlab("Difference of geodesic distance before and after filtering \n from KNN graph using Manhattan distance method") # (-23945,0)
+
+ggplot(data=df_diff_e_hvg_vs_cs,aes(diff_e_hvg_vs_cs_value))+
+  geom_histogram(bins =100,fill="blue",color="black",alpha=0.3)+
+  geom_vline(aes(xintercept = median(diff_e_hvg_vs_cs_value)))+
+  xlab("Difference of geodesic distance before and after filtering \n from KNN graph using Euclidean distance method") # (-1084.599,1110.909)
+
+```
+
+
+
+```{r}
+# compare distance metrics in raw counts/ after filtering hvg/ after pca(30)
+knn_spearman_cor(knn_c_s_hvg_lp[[1]],knn_c_s_hvg_lp[[2]])$spearman_cor
+knn_spearman_cor(knn_c_s_lp[[1]],knn_c_s_lp[[2]])$spearman_cor
+knn_spearman_cor(knn_pca_lp[[1]],knn_pca_lp[[2]])$spearman_cor
+
+```
+
+```{r}
+# compare the result from manhattan distance under different filtering
+knn_spearman_cor(knn_c_s_hvg_lp[[1]],knn_c_s_lp[[1]])$spearman_cor
+knn_spearman_cor(knn_c_s_lp[[1]],knn_pca_lp[[1]])$spearman_cor
+knn_spearman_cor(knn_c_s_hvg_lp[[1]],knn_pca_lp[[1]])$spearman_cor
+```
+
+```{r}
+# compare the result from euclidean distance under different filtering
+knn_spearman_cor(knn_c_s_hvg_lp[[2]],knn_c_s_lp[[2]])$spearman_cor
+knn_spearman_cor(knn_c_s_lp[[2]],knn_pca_lp[[2]])$spearman_cor
+knn_spearman_cor(knn_c_s_hvg_lp[[2]],knn_pca_lp[[2]])$spearman_cor
+```
+
+## Normalization
+
+```{r}
+geodesic_dist_list = list(geod_manhattan_c_s,geod_manhattan_hvg,
+                      geod_euclidean_c_s,geod_euclidean_hvg)
+names(geodesic_dist_list) = c("Raw Count, Manhattan Distance",
+                              "HVG, Manhattan Distance",
+                              "Raw Count, Euclidean Distance",
+                              "HVG, Euclidean Distance")
+```
+
+
+```{r}
+saveRDS(geodesic_dist_list,file = "geodesic_distance_list.RData")
+```
+```{r}
+geodesic_dist_list = readRDS("geodesic_distance_list.RData")
+
+geod_manhattan_c_s = geodesic_dist_list$`Raw Count, Manhattan Distance`
+geod_manhattan_hvg = geodesic_dist_list$`HVG, Manhattan Distance`
+geod_euclidean_c_s = geodesic_dist_list$`Raw Count, Euclidean Distance`
+geod_euclidean_hvg = geodesic_dist_list$`HVG, Euclidean Distance`
+
+```
+
+
+```{r}
+geod_manhattan_hvg[which(geod_manhattan_hvg<quantile(geod_manhattan_hvg,0.025))] = quantile(geod_manhattan_hvg,0.025)
+geod_manhattan_c_s[which(geod_manhattan_c_s<quantile(geod_manhattan_c_s,0.025))] = quantile(geod_manhattan_c_s,0.025)
+geod_euclidean_hvg[which(geod_euclidean_hvg<quantile(geod_euclidean_hvg,0.025))] = quantile(geod_euclidean_hvg,0.025)
+geod_euclidean_c_s[which(geod_euclidean_c_s<quantile(geod_euclidean_c_s,0.025))] = quantile(geod_euclidean_c_s,0.025)
+geod_manhattan_hvg[which(geod_manhattan_hvg>quantile(geod_manhattan_hvg,0.975))] = quantile(geod_manhattan_hvg,0.975)
+geod_manhattan_c_s[which(geod_manhattan_c_s>quantile(geod_manhattan_c_s,0.975))] = quantile(geod_manhattan_c_s,0.975)
+geod_euclidean_hvg[which(geod_euclidean_hvg>quantile(geod_euclidean_hvg,0.975))] = quantile(geod_euclidean_hvg,0.975)
+geod_euclidean_c_s[which(geod_euclidean_c_s>quantile(geod_euclidean_c_s,0.975))] = quantile(geod_euclidean_c_s,0.975)
+```
+
+
+```{r}
+geod_manhattan_hvg_normed = geod_manhattan_hvg/max(geod_manhattan_hvg)
+geod_manhattan_c_s_normed = geod_manhattan_c_s/max(geod_manhattan_c_s)
+geod_euclidean_hvg_normed = geod_euclidean_hvg/max(geod_euclidean_hvg)
+geod_euclidean_c_s_normed = geod_euclidean_c_s/max(geod_euclidean_c_s)
+```
+
+```{r}
+range(geod_manhattan_hvg_normed)
+range(geod_manhattan_c_s_normed)
+range(geod_euclidean_hvg_normed)
+range(geod_euclidean_c_s_normed)
+```
+
+## Visualize the difference of matrices
+
+
+```{r}
+library(pheatmap)
+heatmap1_m = pheatmap::pheatmap(geod_manhattan_c_s_normed, cluster_rows = T, cluster_cols = T,
+         name = "geodesic distance\nmanhattan\nwithout filtering",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+#heatmap1
+heatmap2_m = pheatmap::pheatmap(geod_manhattan_hvg_normed, cluster_rows = T, cluster_cols = T,
+         name = "geodesic distance\nmanhattan\nafter filtering",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+
+geod_manhattan_c_s_cluster <- geod_manhattan_c_s_normed[heatmap1_m$tree_row$order, heatmap1_m$tree_col$order]
+
+geod_manhattan_hvg_cluster <- geod_manhattan_hvg_normed[heatmap1_m$tree_row$order, heatmap1_m$tree_col$order]
+
+pheatmap(geod_manhattan_c_s_cluster,cluster_rows = F, cluster_cols = F,
+         name = "geodesic distance\nfrom Manhattan\nwithout filtering",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F) 
+
+pheatmap(geod_manhattan_hvg_cluster,cluster_rows = F, cluster_cols = F,
+         name = "geodesic distance\nfrom Manhattan\nafter filtering",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+```
+
+```{r}
+library(pheatmap)
+heatmap1 = pheatmap::pheatmap(geod_euclidean_c_s_normed, cluster_rows = T, cluster_cols = T,
+         name = "geodesic distance\nEuclidean\nwithout filtering",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+#heatmap1
+heatmap2 = pheatmap::pheatmap(geod_euclidean_hvg_normed, cluster_rows = T, cluster_cols = T,
+         name = "geodesic distance\nEuclidean\nafter filtering",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+
+geod_euclidean_c_s_cluster <- geod_euclidean_c_s_normed[heatmap1$tree_row$order, heatmap1$tree_col$order]
+
+geod_euclidean_hvg_cluster <- geod_euclidean_hvg_normed[heatmap1$tree_row$order, heatmap1$tree_col$order]
+
+pheatmap(geod_euclidean_c_s_cluster,cluster_rows = F, cluster_cols = F,
+         name = "geodesic distance\nfrom Euclidean\nwithout filtering",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+
+pheatmap(geod_euclidean_hvg_cluster,cluster_rows = F, cluster_cols = F,
+         name = "geodesic distance\nfrom Euclidean\nafter filtering",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+```
+
+### comparing filtering and original
+
+```{r}
+diff_m_hvg_vs_cs = geodesic_dist_list$`HVG, Manhattan Distance` - geodesic_dist_list$`Raw Count, Manhattan Distance`
+diff_e_hvg_vs_cs = geodesic_dist_list$`HVG, Euclidean Distance` - geodesic_dist_list$`Raw Count, Euclidean Distance`
+diff_c_s = geodesic_dist_list$`Raw Count, Manhattan Distance` - geodesic_dist_list$`Raw Count, Euclidean Distance`
+diff_hvg = geodesic_dist_list$`HVG, Manhattan Distance` - geodesic_dist_list$`HVG, Euclidean Distance`
+```
+
+
+
+```{r}
+diff_m_hvg_vs_cs = abs(diff_m_hvg_vs_cs)
+diff_e_hvg_vs_cs = abs(diff_e_hvg_vs_cs)
+diff_m_hvg_vs_cs[which(diff_m_hvg_vs_cs<quantile(diff_m_hvg_vs_cs,0.025))] = quantile(diff_m_hvg_vs_cs,0.025)
+diff_e_hvg_vs_cs[which(diff_e_hvg_vs_cs<quantile(diff_e_hvg_vs_cs,0.025))] = quantile(diff_e_hvg_vs_cs,0.025)
+diff_m_hvg_vs_cs[which(diff_m_hvg_vs_cs>quantile(diff_m_hvg_vs_cs,0.975))] = quantile(diff_m_hvg_vs_cs,0.975)
+diff_e_hvg_vs_cs[which(diff_e_hvg_vs_cs>quantile(diff_e_hvg_vs_cs,0.975))] = quantile(diff_e_hvg_vs_cs,0.975)
+```
+
+
+```{r}
+diff_m_hvg_vs_cs_normed = diff_m_hvg_vs_cs/max(diff_m_hvg_vs_cs)
+diff_e_hvg_vs_cs_normed = diff_e_hvg_vs_cs/max(diff_e_hvg_vs_cs)
+```
+
+
+```{r}
+dif_heatmap1 = pheatmap::pheatmap(diff_m_hvg_vs_cs_normed, cluster_rows = T, cluster_cols = T,
+         name = "Difference matrix\n(Manhattan,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+#heatmap1
+dif_heatmap2 = pheatmap::pheatmap(diff_e_hvg_vs_cs_normed, cluster_rows = T, cluster_cols = T,
+         name = "Difference matrix\n(Euclidean,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+
+dif_heatmap1_cluster <- diff_m_hvg_vs_cs_normed[dif_heatmap1$tree_row$order, dif_heatmap1$tree_col$order]
+dif_heatmap2_cluster <- diff_e_hvg_vs_cs_normed[dif_heatmap1$tree_row$order, dif_heatmap1$tree_col$order]
+# normalized difference matrix
+pheatmap(dif_heatmap1_cluster, cluster_rows = F, cluster_cols = F,
+         name = "Difference matrix\n(Manhattan,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+pheatmap(dif_heatmap2_cluster, cluster_rows = F, cluster_cols = F,
+         name = "Difference matrix\n(Euclidean,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+```
+
+
+### comparing the different distance metrics
+
+```{r}
+diff_c_s = abs(diff_c_s)
+diff_hvg = abs(diff_hvg)
+diff_c_s[which(diff_c_s<quantile(diff_c_s,0.025))] = quantile(diff_c_s,0.025)
+diff_hvg[which(diff_hvg<quantile(diff_hvg,0.025))] = quantile(diff_hvg,0.025)
+diff_c_s[which(diff_c_s>quantile(diff_c_s,0.975))] = quantile(diff_c_s,0.975)
+diff_hvg[which(diff_hvg>quantile(diff_hvg,0.975))] = quantile(diff_hvg,0.975)
+
+diff_c_s_normed = diff_c_s/max(diff_c_s)
+diff_hvg_normed = diff_hvg/max(diff_hvg)
+```
+
+```{r}
+dif_heatmap1 = pheatmap::pheatmap(diff_c_s_normed, cluster_rows = T, cluster_cols = T,
+         name = "Difference matrix\n(Manhattan,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+#heatmap1
+dif_heatmap2 = pheatmap::pheatmap(diff_hvg_normed, cluster_rows = T, cluster_cols = T,
+         name = "Difference matrix\n(Euclidean,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+
+dif_heatmap1_cluster <- diff_c_s_normed[dif_heatmap1$tree_row$order, dif_heatmap1$tree_col$order]
+dif_heatmap2_cluster <- diff_hvg_normed[dif_heatmap1$tree_row$order, dif_heatmap1$tree_col$order]
+# normalized difference matrix
+pheatmap(dif_heatmap1_cluster, cluster_rows = F, cluster_cols = F,
+         name = "Difference matrix\nwithout filtering\n(Manhattan vs Euclidean)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+pheatmap(dif_heatmap2_cluster, cluster_rows = F, cluster_cols = F,
+         name = "Difference matrix\nafter filtering\n(Manhattan vs Euclidean)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+```
+
+
+### 4 difference matrices use the same order to compare
+
+```{r}
+dif_heatmap1 = pheatmap::pheatmap(diff_m_hvg_vs_cs_normed, cluster_rows = T, cluster_cols = T,
+         name = "Difference matrix\n(Manhattan,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+#heatmap1
+dif_heatmap2 = pheatmap::pheatmap(diff_e_hvg_vs_cs_normed, cluster_rows = T, cluster_cols = T,
+         name = "Difference matrix\n(Euclidean,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+
+dif_heatmap3 = pheatmap::pheatmap(diff_c_s_normed, cluster_rows = T, cluster_cols = T,
+         name = "Difference matrix\n(Manhattan,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+#heatmap1
+dif_heatmap4 = pheatmap::pheatmap(diff_hvg_normed, cluster_rows = T, cluster_cols = T,
+         name = "Difference matrix\n(Euclidean,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+
+dif_heatmap1_cluster <- diff_m_hvg_vs_cs_normed[dif_heatmap1$tree_row$order, dif_heatmap1$tree_col$order]
+dif_heatmap2_cluster <- diff_e_hvg_vs_cs_normed[dif_heatmap1$tree_row$order, dif_heatmap1$tree_col$order]
+dif_heatmap3_cluster <- diff_c_s_normed[dif_heatmap1$tree_row$order, dif_heatmap1$tree_col$order]
+dif_heatmap4_cluster <- diff_hvg_normed[dif_heatmap1$tree_row$order, dif_heatmap1$tree_col$order]
+```
+
+
+```{r}
+# normalized difference matrix
+pheatmap(dif_heatmap1_cluster, cluster_rows = F, cluster_cols = F,
+         name = "Difference matrix\n(Manhattan,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+pheatmap(dif_heatmap2_cluster, cluster_rows = F, cluster_cols = F,
+         name = "Difference matrix\n(Euclidean,\nfiltering vs original)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+pheatmap(dif_heatmap3_cluster, cluster_rows = F, cluster_cols = F,
+         name = "Difference matrix\nwithout filtering\n(Manhattan vs Euclidean)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+pheatmap(dif_heatmap4_cluster, cluster_rows = F, cluster_cols = F,
+         name = "Difference matrix\nafter filtering\n(Manhattan vs Euclidean)",
+         color = colorRampPalette(c("white", "red"))(100),
+         show_rownames=F,show_colnames=F)
+```
+
+## correlation plot from sampled entry of matrix
+```{r}
+set.seed(1)
+entry = sample(1:474721, 332305)
+
+geod_manhattan_hvg_normed_sampled = c(geod_manhattan_hvg_normed[entry])
+geod_manhattan_c_s_normed_sampled = c(geod_manhattan_c_s_normed[entry])
+
+df_cor_m_hvg_vs_c = data.frame(geod_manhattan_hvg=geod_manhattan_hvg_normed_sampled,
+                               geod_manhattan_c_s=geod_manhattan_c_s_normed_sampled)
+
+ggplot(df_cor_m_hvg_vs_c,aes(x=geod_manhattan_hvg, 
+                             y=geod_manhattan_c_s))+ 
+  geom_point()
+
+```
+
+
+```{r}
+set.seed(1)
+entry = sample(1:474721, 332305)
+
+geod_euclidean_hvg_normed_sampled = c(geod_euclidean_hvg_normed[entry])
+geod_euclidean_c_s_normed_sampled = c(geod_euclidean_c_s_normed[entry])
+
+# Creating the plot
+plot(geod_euclidean_hvg_normed_sampled, geod_euclidean_c_s_normed_sampled, 
+     pch = 1, col = "lightblue")
+
+# Regression line
+abline(lm(geod_euclidean_hvg_normed_sampled ~ geod_euclidean_c_s_normed_sampled), 
+       col = "red", lwd = 3)
+
+df_cor_e_hvg_vs_c = data.frame(geod_euclidean_hvg=geod_euclidean_hvg_normed_sampled,
+                               geod_euclidean_c_s=geod_euclidean_c_s_normed_sampled)
+
+ggplot(df_cor_e_hvg_vs_c,aes(x=geod_euclidean_hvg, 
+                             y=geod_euclidean_c_s))+ 
+  geom_point()
+
+
+```
+
+
+```{r fig.width=7,fig.height=5}
+df_cor = cbind(df_cor_e_hvg_vs_c,df_cor_m_hvg_vs_c)
+
+pairs(~geod_euclidean_hvg+geod_euclidean_c_s+geod_manhattan_hvg+geod_manhattan_c_s,data=df_cor,
+      labels=c("sampled geodesic distance\nfrom euclidean distance metric\nafter filtering",
+               "sampled geodesic distance\nfrom euclidean distance metric\nwithout filtering",
+               "sampled geodesic distance\nfrom manhattan distance metric\nafter filtering",
+               "sampled geodesic distance\nfrom manhattan distance metric\nwithout filtering"))
+```
+
+```{r}
+cor(df_cor$geod_euclidean_hvg,df_cor$geod_euclidean_c_s,method = "spearman")
+cor(df_cor$geod_manhattan_hvg,df_cor$geod_manhattan_c_s,method = "spearman")
+
+cor(df_cor$geod_euclidean_hvg,df_cor$geod_manhattan_hvg,method = "spearman")
+cor(df_cor$geod_euclidean_c_s,df_cor$geod_manhattan_c_s,method = "spearman")
+```
+
+
+## Clustering analysis
+
+```{r}
+source("DEG_utils.R")
+```
+
+
+```{r}
+geodesic_dist_list = readRDS("geodesic_distance_list.RData")
+
+geod_manhattan_c_s = geodesic_dist_list$`Raw Count, Manhattan Distance`
+geod_manhattan_hvg = geodesic_dist_list$`HVG, Manhattan Distance`
+geod_euclidean_c_s = geodesic_dist_list$`Raw Count, Euclidean Distance`
+geod_euclidean_hvg = geodesic_dist_list$`HVG, Euclidean Distance`
+
+geod_manhattan_hvg[which(geod_manhattan_hvg<quantile(geod_manhattan_hvg,0.025))] = quantile(geod_manhattan_hvg,0.025)
+geod_manhattan_c_s[which(geod_manhattan_c_s<quantile(geod_manhattan_c_s,0.025))] = quantile(geod_manhattan_c_s,0.025)
+geod_euclidean_hvg[which(geod_euclidean_hvg<quantile(geod_euclidean_hvg,0.025))] = quantile(geod_euclidean_hvg,0.025)
+geod_euclidean_c_s[which(geod_euclidean_c_s<quantile(geod_euclidean_c_s,0.025))] = quantile(geod_euclidean_c_s,0.025)
+geod_manhattan_hvg[which(geod_manhattan_hvg>quantile(geod_manhattan_hvg,0.975))] = quantile(geod_manhattan_hvg,0.975)
+geod_manhattan_c_s[which(geod_manhattan_c_s>quantile(geod_manhattan_c_s,0.975))] = quantile(geod_manhattan_c_s,0.975)
+geod_euclidean_hvg[which(geod_euclidean_hvg>quantile(geod_euclidean_hvg,0.975))] = quantile(geod_euclidean_hvg,0.975)
+geod_euclidean_c_s[which(geod_euclidean_c_s>quantile(geod_euclidean_c_s,0.975))] = quantile(geod_euclidean_c_s,0.975)
+
+geod_manhattan_hvg_normed = geod_manhattan_hvg/max(geod_manhattan_hvg)
+geod_manhattan_c_s_normed = geod_manhattan_c_s/max(geod_manhattan_c_s)
+geod_euclidean_hvg_normed = geod_euclidean_hvg/max(geod_euclidean_hvg)
+geod_euclidean_c_s_normed = geod_euclidean_c_s/max(geod_euclidean_c_s)
+```
+
+
+```{r}
+nn_sparseMatrix = function(geodesic_distance_matrix,k=30){
+  # first find the names of the 30 nearest neighbor for each cell based on the geodesic distance 
+  nn_list = list()
+  for (i in 1:nrow(geodesic_distance_matrix)) {
+    nn_list[[i]] = names(sort(geodesic_distance_matrix[i,]))[1:k]
+  }
+  
+  # SCT_nn: the matrix contains only 0 and 1
+  tmp_nn = geodesic_distance_matrix
+  for (i in 1:nrow(geodesic_distance_matrix)) {
+    tmp_nn[i,] = 0
+    tmp_nn[i,nn_list[[i]]] = 1
+  }
+  sparsematrix_nn = as(tmp_nn, "sparseMatrix")
+  
+  # SCT_snn: the nearest neighbor is 1/30, the second nearest is 2/30 etc ...
+  # first prepare the 1/30, 2/30, 3/30 ...
+  snn = c()
+  for (i in 1:k){
+    snn[i] = i/k
+  }
+  # add the names of the nearest neighbor
+  snn_list = list()
+  for (i in 1:nrow(geodesic_distance_matrix)){
+    snn_list[[i]] = snn
+    names(snn_list[[i]]) = nn_list[[i]]
+  }
+  # put the values (1/30, 2/30, 3/30 ...) into the matrix
+  tmp_snn = geodesic_distance_matrix
+  for (i in 1:nrow(geodesic_distance_matrix)) {
+    tmp_snn[i,] = 0
+    tmp_snn[i,nn_list[[i]]] = snn_list[[i]]
+  }
+  sparsematrix_snn = as(tmp_snn, "sparseMatrix")
+
+  return(list(SCT_nn = sparsematrix_nn,
+              SCT_snn = sparsematrix_snn))
+
+}
+```
+
+```{r}
+nn_euclidean_s = nn_sparseMatrix(geod_euclidean_c_s_normed)[[1]]
+snn_euclidean_s = nn_sparseMatrix(geod_euclidean_c_s_normed)[[2]]
+nn_euclidean_hvg = nn_sparseMatrix(geod_euclidean_hvg_normed)[[1]]
+snn_euclidean_hvg = nn_sparseMatrix(geod_euclidean_hvg_normed)[[2]]
+nn_manhattan_s = nn_sparseMatrix(geod_manhattan_c_s_normed)[[1]]
+snn_manhattan_s = nn_sparseMatrix(geod_manhattan_c_s_normed)[[2]]
+nn_manhattan_hvg = nn_sparseMatrix(geod_manhattan_hvg_normed)[[1]]
+snn_manhattan_hvg = nn_sparseMatrix(geod_manhattan_hvg_normed)[[2]]
+```
+
+
+```{r}
+find_seurat_clusters_nn <-
+    function(seurat_obj,# with our nearest neighbor
+             findPC_npcs = 100,
+             pcs = NULL,
+             clustering_resolution = 0.5,
+             redo_knn = FALSE,
+             verbose = FALSE) {
+        
+      seurat_obj <- FindClusters(seurat_obj,#graph.name = "SCT_nn",
+                                   resolution = clustering_resolution,
+                                   verbose = verbose)
+        
+        seurat_clusters = as.numeric(as.character(seurat_obj$seurat_clusters)) + 1
+        Idents(seurat_obj) <- as.factor(seurat_clusters)
+        
+        list(
+            seurat_clusters = seurat_clusters,
+            n_clusters = max(seurat_clusters),
+            clustering_resolution = clustering_resolution,
+            pcs = pcs,
+            seurat_obj = seurat_obj,
+            knn_graph = seurat_obj@graphs$RNA_snn
+        )
+    }
+```
+
+
+
+```{r}
+c_s = readRDS("c_s.RData")
+seurat_object_s = CreateSeuratObject(c_s)
+```
+
+```{r}
+tmp = find_seurat_clusters(seurat_object_s)
+
+tmp$seurat_obj
+```
+
+```{r}
+seurat_object_s_e = seurat_object_s
+seurat_object_s_e@graphs$RNA_nn = as.Graph(nn_euclidean_s)
+seurat_object_s_e@graphs$RNA_snn = as.Graph(snn_euclidean_s)
+
+clusters_result_s_e = find_seurat_clusters_nn(seurat_object_s_e)
+clusters_result_s_e$seurat_obj
+clusters_result_s_e$n_clusters
+
+seurat_object_s_m = seurat_object_s
+seurat_object_s_m@graphs$RNA_nn = as.Graph(nn_manhattan_s)
+seurat_object_s_m@graphs$RNA_snn = as.Graph(snn_manhattan_s)
+
+clusters_result_s_m = find_seurat_clusters_nn(seurat_object_s_m)
+clusters_result_s_m$seurat_obj
+clusters_result_s_m$n_clusters
+
+```
+
+
+```{r}
+seurat_object_hvg_e = seurat_object
+seurat_object_hvg_e@graphs$RNA_nn = as.Graph(nn_euclidean_hvg)
+seurat_object_hvg_e@graphs$RNA_snn = as.Graph(snn_euclidean_hvg)
+
+clusters_result_hvg_e = find_seurat_clusters_nn(seurat_object_hvg_e)
+clusters_result_hvg_e$seurat_obj
+clusters_result_hvg_e$n_clusters
+
+seurat_object_hvg_m = seurat_object
+seurat_object_hvg_m@graphs$RNA_nn = as.Graph(nn_manhattan_hvg)
+seurat_object_hvg_m@graphs$RNA_snn = as.Graph(snn_manhattan_hvg)
+
+clusters_result_hvg_m = find_seurat_clusters_nn(seurat_object_hvg_m)
+clusters_result_hvg_m$seurat_obj
+clusters_result_hvg_m$n_clusters
+```
+
+```{r}
+resolution = 0.5
+pcs = 20
+nfeatures = 2000
+verbose = FALSE
+
+seurat_object = CreateSeuratObject(c_s)
+
+seurat_object <- NormalizeData(seurat_object)
+seurat_object <- FindVariableFeatures(seurat_object,
+                                        selection.method = "vst",
+                                        nfeatures = nfeatures)
+
+seurat_object <- ScaleData(seurat_object,
+                            features = rownames(seurat_object))
+
+seurat_object <- RunPCA(seurat_object,
+                        features = VariableFeatures(object = seurat_object), 
+                        npcs = 50,
+                        verbose = verbose)
+
+# run clustering and dim reduction
+seurat_object <- FindNeighbors(seurat_object, dims = 1:pcs,verbose = verbose)
+clusters_result_standard = find_seurat_clusters_nn(seurat_object)
+clusters_result_standard$n_clusters
+clusters_result_standard$seurat_obj
+```
+
+```{r}
+resolution = 0.5
+pcs = 20
+nfeatures = 36601
+verbose = FALSE
+
+seurat_object_unfilter = CreateSeuratObject(c_s)
+
+seurat_object_unfilter <- NormalizeData(seurat_object_unfilter)
+seurat_object_unfilter <- FindVariableFeatures(seurat_object_unfilter,
+                                        selection.method = "vst",
+                                        nfeatures = nfeatures)
+
+seurat_object_unfilter <- ScaleData(seurat_object_unfilter,
+                            features = rownames(seurat_object_unfilter))
+
+seurat_object_unfilter <- RunPCA(seurat_object_unfilter,
+                        features = VariableFeatures(object = seurat_object_unfilter), 
+                        npcs = 50,
+                        verbose = verbose)
+
+# run clustering and dim reduction
+seurat_object_unfilter <- FindNeighbors(seurat_object_unfilter, dims = 1:pcs,verbose = verbose)
+clusters_result_standard_unfilter = find_seurat_clusters_nn(seurat_object_unfilter)
+clusters_result_standard_unfilter$seurat_obj
+clusters_result_standard_unfilter$n_clusters
+```
+
+
+
+
+```{r}
+seurat_clusters_nn <-
+    function(seurat_obj,# with our nearest neighbor
+             n_clusters = NULL,
+             pcs = NULL,
+             start_resolution = 0.5,
+             step_size = 0.1,
+             redo_knn = FALSE,
+             verbose = FALSE) {
+        clusters_result <- find_seurat_clusters_nn(
+            seurat_obj,
+            pcs = pcs,
+            clustering_resolution = start_resolution,
+            redo_knn = redo_knn,
+            verbose = verbose
+        )
+        
+        # if we don't need to tune clustering_resolution, just return
+        if (is.null(n_clusters)) {
+            return(clusters_result)
+        }
+        
+        # if we need to have a fixed # of clusters, tune the clustering_resolution to achieve this
+        tuned_resolution <- start_resolution
+        last_nclusters <- clusters_result$n_clusters
+        while (last_nclusters != n_clusters) {
+            if (last_nclusters > n_clusters) {
+                tuned_resolution <- round(tuned_resolution - step_size, 3)
+            } else {
+                tuned_resolution <- round(tuned_resolution + step_size, 3)
+            }
+            clusters_result <-
+                find_seurat_clusters_nn(
+                    seurat_obj = clusters_result$seurat_obj,
+                    pcs = pcs,
+                    clustering_resolution = tuned_resolution,
+                    verbose = verbose
+                )
+            
+            if ((last_nclusters > n_clusters) != (clusters_result$n_clusters > n_clusters)) {
+                step_size <- round(step_size / 1.5, 3)
+            }
+            
+            # avoid infinit loop
+            last_nclusters <-
+                length(unique(clusters_result$seurat_clusters))
+        }
+        clusters_result
+    }
+```
+
+```{r}
+standard_cluster_result = seurat_clusters_nn(seurat_object,n_clusters = 6)
+hvf_e_cluster_result = seurat_clusters_nn(seurat_object_hvg_e,n_clusters = 6)
+hvf_m_cluster_result = seurat_clusters_nn(seurat_object_hvg_m,n_clusters = 6)
+standard_unfilter_cluster_result = seurat_clusters_nn(seurat_object_unfilter,n_clusters = 6)
+unfilter_m_cluster_result = seurat_clusters_nn(seurat_object_s_m,n_clusters = 6)
+unfilter_e_cluster_result = seurat_clusters_nn(seurat_object_s_e,n_clusters = 6)
+```
+
+
+```{r}
+standard_cluster_result
+hvf_e_cluster_result
+hvf_m_cluster_result
+standard_unfilter_cluster_result
+unfilter_m_cluster_result
+unfilter_e_cluster_result
+```
+
+
+```{r}
+adjustedRandIndex(standard_cluster_result$seurat_clusters,
+                  standard_unfilter_cluster_result$seurat_clusters)
+```
+```{r}
+adjustedRandIndex(standard_cluster_result$seurat_clusters,
+                  hvf_e_cluster_result$seurat_clusters)
+adjustedRandIndex(standard_cluster_result$seurat_clusters,
+                  hvf_m_cluster_result$seurat_clusters)
+adjustedRandIndex(standard_cluster_result$seurat_clusters,
+                  unfilter_e_cluster_result$seurat_clusters)
+adjustedRandIndex(standard_cluster_result$seurat_clusters,
+                  unfilter_m_cluster_result$seurat_clusters)
+```
+
+
+```{r}
+adjustedRandIndex(standard_unfilter_cluster_result$seurat_clusters,
+                  hvf_e_cluster_result$seurat_clusters)
+adjustedRandIndex(standard_unfilter_cluster_result$seurat_clusters,
+                  hvf_m_cluster_result$seurat_clusters)
+adjustedRandIndex(standard_unfilter_cluster_result$seurat_clusters,
+                  unfilter_e_cluster_result$seurat_clusters)
+adjustedRandIndex(standard_unfilter_cluster_result$seurat_clusters,
+                  unfilter_m_cluster_result$seurat_clusters)
+```
+
+
+
+
+
+
+
